@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 import optparse
 import paramiko
 import tempfile
@@ -9,7 +11,19 @@ import os
 import sys
 import logging
 import tarfile
+import untangle
 from multiprocessing import Pool
+
+# This script syncs local changes made to APS application to remote hosts.
+# It automatically finds APS package location and rewrites files.
+# It doesn't create new files or directories.
+# Its main use is to apply local JS changes to one or several remote hosts.
+# Run as shown in the example below, then press Enter every time you want to sync files.
+#
+# Usage: python sync-aps-js.py \
+#               --appmeta /home/anton/dev/osa/modules/platform/cells/js-ui/aps_init_wizard/application/src/APP-META.xml \
+#               --hosts destinationpoamn-1d35078c5920.aqa.int.zone,sourcepoamn-1d35078c5920.aqa.int.zone
+#
 
 LOG_FORMAT = "%(levelname)s %(asctime)s %(message)s"
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format=LOG_FORMAT)
@@ -17,7 +31,7 @@ log = logging.getLogger()
 
 parser = optparse.OptionParser()
 parser.add_option('--hosts', dest="hosts", type="string", help="Comma separated list of hosts to update")
-parser.add_option('--app', dest="app", type="string", help="Application name to sync")
+parser.add_option('--appmeta', dest="appmeta", type="string", help="Full path to APP-META.xml in repository that contains changes")
 
 app_update = "/tmp/app-update.tar"
 std_login = 'root'
@@ -58,45 +72,48 @@ def find_package_uid(host_name, app_name):
     raise Exception("Couldn't find a package for application with name '%s' on host '%s'" % (app_name, host_name))
 
 def update_host(tar, host_to_package_id, host_name):
+    log.info("Syncing to host %s" % host_name)
     package_id = host_to_package_id[host_name]
     transport = paramiko.Transport((host_name, 22))
     transport.connect(username=std_login, password=std_pass)
     sftp = paramiko.SFTPClient.from_transport(transport)
-    log.info("Syncing to host %s" % host_name)
-    log.info("Copying files from %s to %s on host %s" % (tar, package_id, host_name))
+    log.info("Copying update '%s' to package '%s' on host '%s'" % (tar, package_id, host_name))
     sftp.put(tar, app_update)
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     ssh.connect(host_name, 22, 'root', '1q2w3e')
     target = "/usr/local/pem/APS/packages/%s/" % package_id
     command = "tar -xvf %s -C %s" % (app_update, target)
+    log.info("Updating package '%s' on host '%s' with command '%s'" % (package_id, host_name, command))
     ssh.exec_command(command)
     log.info("All done here!")
-
-def get_target_hosts(opts):
-    if not opts.hosts and not opts.vm:
-        raise Exception("Either list of hosts os spconfig VM id must be specified as target")
-    if opts.hosts:
-        return opts.hosts.split(",")
 
 def update_hosts(app_name, source, host_to_package_id):
     log.info("Syncing to hosts %s" % hosts)
     tar = tarfile.open(app_update, "w")
-    tar.add(source, "ui")
+    tar.add(source, ".")
     tar.close()
     pool = Pool(processes=10)
     asyncs = []
     for host in host_to_package_id:
         asyncs.append(pool.apply_async(update_host, (app_update, host_to_package_id, host)))
     for async in asyncs:
-        async.wait(10000)        
+        async.wait(60)
 
-def update_hosts_error(err):
-    log.error("Host update failed: %s" % err)
+def get_target_hosts(opts):
+    if not opts.hosts:
+        raise Exception("List of target hosts must be specified")
+    return [host.strip() for host in opts.hosts.split(",")]
+
+def get_app_sources_and_name(opts):
+    if not opts.appmeta:
+        raise Exception("Full path to application APP-META.xml file in repository containing changes must be specified")
+    app_meta = untangle.parse(opts.appmeta)
+    return (app_meta.application.name.cdata, opts.appmeta.replace("/APP-META.xml", ""))
 
 if __name__ == "__main__":
     (opts, args) = parser.parse_args()
-    app_name = opts.app
+    app_name, app_sources = get_app_sources_and_name(opts)
     hosts = get_target_hosts(opts)
     host_to_package_id = {}
     for host in hosts:
@@ -107,9 +124,5 @@ if __name__ == "__main__":
         cmd = raw_input()
         if cmd == "quit":
             exit(0)
-        update_hosts(app_name, "/home/anton/dev/osa/modules/platform/cells/js-ui/aps_init_wizard/application/src/ui", host_to_package_id)
+        update_hosts(app_name, app_sources, host_to_package_id)
         print "\n"
-
-# 1 from directory in js-ui - fetch app name
-# 2 to spconfig - auto find hosts
-# 3 logs, refactoring
